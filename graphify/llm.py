@@ -10,6 +10,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -213,6 +214,15 @@ BACKENDS: dict[str, dict] = {
         "max_tokens": 16384,
         # Claude Code is multimodal; images are passed by path and read with the
         # CLI's Read tool rather than as inline base64 (see `_call_claude_cli`).
+        "vision": True,
+    },
+    "codex-cli": {
+        # Route through the locally authenticated Codex harness instead of
+        # silently sending a caller's corpus to a different provider.
+        "default_model": "codex-harness",
+        "pricing": {"input": 0.0, "output": 0.0},
+        "temperature": 0,
+        "max_tokens": 16384,
         "vision": True,
     },
 }
@@ -750,7 +760,7 @@ _MAX_IMAGES_PER_CHUNK = 20
 # Backends that read an image by file path (claude-cli's Read tool)
 # instead of inlining base64. They open the file themselves and downsample as
 # needed, so `_MAX_IMAGE_BYTES` does not apply and the bytes never need loading.
-_PATH_IMAGE_BACKENDS = {"claude-cli"}
+_PATH_IMAGE_BACKENDS = {"claude-cli", "codex-cli"}
 
 
 @dataclass
@@ -1355,6 +1365,82 @@ _EXTRACTION_JSON_SCHEMA = json.dumps(
     }
 )
 
+# Codex's output-schema mode is stricter than Claude's inline schema mode: every
+# object must list every allowed property, require each listed property, and set
+# ``additionalProperties`` to false. Keep this separate so the mature Claude
+# compatibility path can remain permissive for provider-specific fields.
+_CODEX_EXTRACTION_JSON_SCHEMA = json.dumps(
+    {
+        "type": "object",
+        "properties": {
+            "nodes": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "label": {"type": "string"},
+                        "file_type": {"type": "string"},
+                        "source_file": {"type": "string"},
+                        "source_location": {"type": ["string", "null"]},
+                        "source_url": {"type": ["string", "null"]},
+                        "captured_at": {"type": ["string", "null"]},
+                        "author": {"type": ["string", "null"]},
+                        "contributor": {"type": ["string", "null"]},
+                    },
+                    "required": [
+                        "id", "label", "file_type", "source_file", "source_location",
+                        "source_url", "captured_at", "author", "contributor",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+            "edges": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "source": {"type": "string"},
+                        "target": {"type": "string"},
+                        "relation": {"type": "string"},
+                        "confidence": {"type": "string"},
+                        "confidence_score": {"type": "number"},
+                        "source_file": {"type": "string"},
+                        "source_location": {"type": ["string", "null"]},
+                        "weight": {"type": "number"},
+                    },
+                    "required": [
+                        "source", "target", "relation", "confidence", "confidence_score",
+                        "source_file", "source_location", "weight",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+            "hyperedges": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "label": {"type": "string"},
+                        "nodes": {"type": "array", "items": {"type": "string"}},
+                        "relation": {"type": "string"},
+                        "confidence": {"type": "string"},
+                        "confidence_score": {"type": "number"},
+                        "source_file": {"type": "string"},
+                    },
+                    "required": [
+                        "id", "label", "nodes", "relation", "confidence", "confidence_score", "source_file",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["nodes", "edges", "hyperedges"],
+        "additionalProperties": False,
+    }
+)
+
 # Cache the `--json-schema` capability probe per resolved claude command so it
 # runs at most once per process (extract fans a chunk out per file/slice).
 _JSON_SCHEMA_SUPPORT: dict[str, bool] = {}
@@ -1542,6 +1628,93 @@ def _call_claude_cli(user_message: str, max_tokens: int = 8192, *, deep_mode: bo
     return result
 
 
+def _codex_cli_agent_message(jsonl: str) -> tuple[str, dict]:
+    """Read the final agent message and usage from Codex's JSONL event stream."""
+    message = ""
+    usage: dict = {}
+    for line in jsonl.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "item.completed":
+            item = event.get("item") or {}
+            if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
+                message = item["text"]
+        elif event.get("type") == "turn.completed" and isinstance(event.get("usage"), dict):
+            usage = event["usage"]
+    if not message:
+        raise RuntimeError("codex exec produced no agent_message JSON result")
+    return message, usage
+
+
+def _run_codex_cli(prompt: str, *, output_schema: str | None = None, images: list[_ImageRef] | None = None) -> tuple[str, dict]:
+    """Invoke Codex ephemerally and return its final agent message plus usage."""
+    import shutil
+    import subprocess
+
+    if shutil.which("codex") is None:
+        raise RuntimeError(
+            "Codex CLI not found on $PATH. Install Codex and authenticate before "
+            "selecting the codex-cli backend."
+        )
+    schema_path: str | None = None
+    try:
+        cli_args = ["codex", "exec", "--json", "--ephemeral"]
+        if output_schema is not None:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".json", delete=False) as schema_file:
+                schema_file.write(output_schema)
+                schema_path = schema_file.name
+            cli_args.extend(["--output-schema", schema_path])
+        for image in images or []:
+            cli_args.extend(["--image", str(image.path)])
+        cli_model = os.environ.get("GRAPHIFY_CODEX_CLI_MODEL", "").strip()
+        if cli_model:
+            cli_args.extend(["--model", cli_model])
+        cli_args.append("-")
+        proc = subprocess.run(
+            cli_args,
+            input=prompt,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_resolve_api_timeout(),
+            check=False,
+            **_no_window_kwargs(),
+        )
+    finally:
+        if schema_path is not None:
+            Path(schema_path).unlink(missing_ok=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"codex exec exited {proc.returncode}: {proc.stderr.strip()[:500]}")
+    return _codex_cli_agent_message(proc.stdout)
+
+
+def _call_codex_cli(user_message: str, max_tokens: int = 8192, *, deep_mode: bool = False, images: list[_ImageRef] | None = None) -> dict:
+    """Call the invoking Codex harness with Graphify's constrained graph schema."""
+    del max_tokens  # The Codex harness owns token sizing; the schema pins output shape.
+    if images:
+        user_message = _with_image_notes(user_message, images, with_paths=True)
+    combined_message = (
+        _extraction_system(deep=deep_mode)
+        + "\n\n---\n"
+        + "Now extract the knowledge graph from the following source file(s) "
+        + "and output ONLY the JSON object described by the output schema. "
+        + "For this Codex response, omit input_tokens and output_tokens; Graphify records harness usage.\n\n"
+        + user_message
+    )
+    raw_content, usage = _run_codex_cli(
+        combined_message, output_schema=_CODEX_EXTRACTION_JSON_SCHEMA, images=images,
+    )
+    result = _parse_llm_json(raw_content)
+    result["input_tokens"] = int(usage.get("input_tokens", 0) or 0)
+    result["output_tokens"] = int(usage.get("output_tokens", 0) or 0)
+    result["model"] = "codex-harness"
+    result["finish_reason"] = "length" if _response_is_hollow(raw_content, result) else "stop"
+    return result
+
+
 def _azure_client(api_key: str, endpoint: str):
     """Construct an AzureOpenAI client with env-driven api_version and timeout."""
     try:
@@ -1698,7 +1871,7 @@ def extract_files_direct(
             file=sys.stderr,
         )
         key = "ollama"
-    if not key and backend not in ("bedrock", "claude-cli"):
+    if not key and backend not in ("bedrock", "claude-cli", "codex-cli"):
         raise ValueError(
             f"No API key for backend '{backend}'. "
             f"Set {_format_backend_env_keys(backend)} or pass api_key=."
@@ -1722,6 +1895,8 @@ def extract_files_direct(
         result = _call_claude(key, mdl, user_msg, max_tokens=max_out, deep_mode=deep_mode, images=image_refs)
     elif backend == "claude-cli":
         result = _call_claude_cli(user_msg, max_tokens=max_out, deep_mode=deep_mode, images=image_refs)
+    elif backend == "codex-cli":
+        result = _call_codex_cli(user_msg, max_tokens=max_out, deep_mode=deep_mode, images=image_refs)
     elif backend == "bedrock":
         result = _call_bedrock(mdl, user_msg, max_tokens=max_out, deep_mode=deep_mode, images=image_refs)
     elif backend == "azure":
@@ -2251,6 +2426,8 @@ def extract_corpus_parallel(
     # over session state. Force serial unless the user explicitly opts in.
     if backend == "claude-cli" and os.environ.get("GRAPHIFY_CLAUDE_CLI_PARALLEL", "").strip() != "1":
         max_concurrency = 1
+    if backend == "codex-cli" and os.environ.get("GRAPHIFY_CODEX_CLI_PARALLEL", "").strip() != "1":
+        max_concurrency = 1
     def _checkpoint_chunk(result: dict, chunk: "list[Path | FileSlice]") -> None:
         # Persist each chunk's semantic results to the cache as soon as it
         # completes. Without this, the semantic cache is only written once, at
@@ -2493,7 +2670,7 @@ def _call_llm(
         ollama_url = _resolve_ollama_base_url(cfg.get("base_url", ""))
         _validate_ollama_base_url(ollama_url)
         key = "ollama"
-    if not key and backend not in ("bedrock", "claude-cli"):
+    if not key and backend not in ("bedrock", "claude-cli", "codex-cli"):
         raise ValueError(
             f"No API key for backend '{backend}'. Set {_format_backend_env_keys(backend)}."
         )
@@ -2560,6 +2737,12 @@ def _call_llm(
                 cli_usage.get("output_tokens", 0),
             )
         return envelope.get("result", "")
+
+
+    if backend == "codex-cli":
+        result_text, usage = _run_codex_cli(prompt)
+        _rec(usage.get("input_tokens", 0), usage.get("output_tokens", 0))
+        return result_text
 
 
     if backend == "bedrock":
@@ -2724,6 +2907,32 @@ def _validate_ollama_base_url(url: str, *, warn: bool = True) -> None:
         )
 
 
+def _caller_harness_backend() -> str | None:
+    """Use the caller's own agent harness, failing closed if it is unavailable."""
+    import shutil
+
+    if os.environ.get("CODEX_THREAD_ID"):
+        if shutil.which("codex") is None:
+            raise RuntimeError(
+                "Codex session detected but the Codex CLI is unavailable; refusing to "
+                "fall back to a different provider."
+            )
+        return "codex-cli"
+    if os.environ.get("CLAUDECODE"):
+        if shutil.which("claude") is None:
+            raise RuntimeError(
+                "Claude Code session detected but the Claude CLI is unavailable; refusing to "
+                "fall back to a different provider."
+            )
+        return "claude-cli"
+    return None
+
+
+def resolve_backend(explicit_backend: str | None = None) -> str | None:
+    """Return an explicit backend unchanged, otherwise detect the active caller."""
+    return explicit_backend if explicit_backend is not None else detect_backend()
+
+
 def detect_backend() -> str | None:
     """Return the name of whichever backend has an API key set, or None.
 
@@ -2735,6 +2944,9 @@ def detect_backend() -> str | None:
     key now keeps you on the paid backend; remove the paid key (or pass
     --backend ollama explicitly) to route to the local model.
     """
+    caller_backend = _caller_harness_backend()
+    if caller_backend:
+        return caller_backend
     for backend in ("gemini", "kimi", "claude", "openai", "deepseek"):
         if _get_backend_api_key(backend):
             return backend
@@ -2751,7 +2963,7 @@ def detect_backend() -> str | None:
         _validate_ollama_base_url(ollama_url)
         return "ollama"
     for name in BACKENDS:
-        if name not in ("gemini", "kimi", "claude", "openai", "deepseek", "azure", "bedrock", "ollama", "claude-cli"):
+        if name not in ("gemini", "kimi", "claude", "openai", "deepseek", "azure", "bedrock", "ollama", "claude-cli", "codex-cli"):
             if _get_backend_api_key(name):
                 return name
     return None
@@ -2963,6 +3175,8 @@ def label_communities(
     if backend == "ollama" and os.environ.get("GRAPHIFY_OLLAMA_PARALLEL", "").strip() != "1":
         max_concurrency = 1
     if backend == "claude-cli" and os.environ.get("GRAPHIFY_CLAUDE_CLI_PARALLEL", "").strip() != "1":
+        max_concurrency = 1
+    if backend == "codex-cli" and os.environ.get("GRAPHIFY_CODEX_CLI_PARALLEL", "").strip() != "1":
         max_concurrency = 1
     workers = max(1, min(max_concurrency, n_batches))
 
