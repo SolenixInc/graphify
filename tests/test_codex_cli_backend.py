@@ -61,6 +61,13 @@ def test_codex_cli_uses_lean_jsonl_ephemeral_and_schema_output(fake_codex):
     assert "graphify semantic extraction agent" in sent
 
 
+def test_codex_cli_passes_skip_git_repo_check(fake_codex):
+    llm._call_codex_cli("UNIQUE_SOURCE_MARKER")
+
+    argv = fake_codex.call_args.args[0]
+    assert "--skip-git-repo-check" in argv
+
+
 def test_codex_cli_refuses_missing_harness():
     with patch("shutil.which", return_value=None):
         with pytest.raises(RuntimeError, match="Codex CLI not found"):

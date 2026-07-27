@@ -1664,7 +1664,7 @@ def _run_codex_cli(prompt: str, *, output_schema: str | None = None, images: lis
         # caller's full desktop configuration (plugins, MCP servers, and skills).
         # Loading that unrelated context for every semantic chunk can prevent a
         # bounded extraction from completing.
-        cli_args = ["codex", "exec", "--json", "--ephemeral", "--ignore-user-config"]
+        cli_args = ["codex", "exec", "--json", "--ephemeral", "--skip-git-repo-check", "--ignore-user-config"]
         if output_schema is not None:
             with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".json", delete=False) as schema_file:
                 schema_file.write(output_schema)
