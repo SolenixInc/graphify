@@ -48,11 +48,12 @@ def test_codex_cli_returns_parsed_graph_fragment(fake_codex):
     assert result["hyperedges"] == []
 
 
-def test_codex_cli_uses_jsonl_ephemeral_and_schema_output(fake_codex):
+def test_codex_cli_uses_lean_jsonl_ephemeral_and_schema_output(fake_codex):
     llm._call_codex_cli("UNIQUE_SOURCE_MARKER")
 
     argv = fake_codex.call_args.args[0]
     assert argv[:4] == ["codex", "exec", "--json", "--ephemeral"]
+    assert "--ignore-user-config" in argv
     assert "--output-schema" in argv
     assert argv[-1] == "-"
     sent = fake_codex.call_args.kwargs["input"]
