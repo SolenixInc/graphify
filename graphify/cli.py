@@ -2925,7 +2925,7 @@ def dispatch_command(cmd: str) -> None:
         # an API key; the key is enforced below only when there's LLM work.
         from graphify.llm import (
             BACKENDS as _BACKENDS,
-            detect_backend as _detect_backend,
+            resolve_backend as _resolve_backend,
             estimate_cost as _estimate_cost,
             extract_corpus_parallel as _extract_corpus_parallel,
             _format_backend_env_keys,
@@ -2933,7 +2933,7 @@ def dispatch_command(cmd: str) -> None:
         )
         needs_llm = bool(semantic_files) or dedup_llm
         if backend is None and needs_llm:
-            backend = _detect_backend()
+            backend = _resolve_backend()
         if backend is not None and backend not in _BACKENDS:
             print(
                 f"error: unknown backend '{backend}'. "
@@ -3001,6 +3001,16 @@ def dispatch_command(cmd: str) -> None:
                         print(
                             "error: backend 'claude-cli' requires the `claude` CLI on $PATH "
                             "(install Claude Code and run `claude` once to authenticate).",
+                            file=sys.stderr,
+                        )
+                        sys.exit(1)
+                elif backend == "codex-cli":
+                    import shutil as _shutil
+                    allow_no_key = _shutil.which("codex") is not None
+                    if not allow_no_key:
+                        print(
+                            "error: backend 'codex-cli' requires the `codex` CLI on $PATH "
+                            "(install Codex and authenticate).",
                             file=sys.stderr,
                         )
                         sys.exit(1)
